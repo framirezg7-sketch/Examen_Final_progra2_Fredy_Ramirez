@@ -98,3 +98,20 @@ CREATE INDEX idx_history_ticket ON history(ticket_id);
 -- Indice parcial: solo indexa lo que la bandeja consulta (no leidas).
 CREATE INDEX idx_notifications_unread ON notifications(user_id) WHERE read_at IS NULL;
 
+
+-- Time entries: minutos trabajados por el personal en un ticket (Ficha 21)
+CREATE TABLE time_entries (
+  id            SERIAL                      NOT NULL,
+  ticket_id     INTEGER                     NOT NULL,
+  technician_id INTEGER                     NOT NULL,
+  minutes       INTEGER                     NOT NULL,
+  description   VARCHAR(255)                NOT NULL,
+  worked_on     DATE                        NOT NULL,
+  created_at    TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  CHECK (minutes >= 1 AND minutes <= 480),
+  FOREIGN KEY (ticket_id)     REFERENCES tickets (id) ON DELETE CASCADE,
+  FOREIGN KEY (technician_id) REFERENCES users (id)
+);
+
+CREATE INDEX idx_time_entries_ticket ON time_entries(ticket_id);

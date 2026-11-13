@@ -27,6 +27,7 @@ class InMemoryTicketRepository(TicketRepository):
         self._next_ticket_id = 1
         self._next_comment_id = 1
         self._next_event_id = 1
+        self._next_time_entry_id = 1
 
     def add(self, ticket: Ticket) -> Ticket:
         ticket.id = self._next_ticket_id
@@ -44,6 +45,10 @@ class InMemoryTicketRepository(TicketRepository):
             if event.id is None:
                 event.id = self._next_event_id
                 self._next_event_id += 1
+        for te in ticket.time_entries:
+            if te.id is None:
+                te.id = self._next_time_entry_id
+                self._next_time_entry_id += 1
         self._items[ticket.id] = ticket
         return ticket
 

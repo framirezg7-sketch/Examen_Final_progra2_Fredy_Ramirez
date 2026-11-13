@@ -8,9 +8,9 @@ solo cambia que repositorio se inyecta.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import FetchedValue, ForeignKey, String, Text, func, select, update
+from sqlalchemy import CheckConstraint, FetchedValue, ForeignKey, String, Text, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -26,6 +26,7 @@ from app.domain.errors import ConflictError
 from app.models.comments import Comment
 from app.models.entities import HistoryEvent, Ticket, User
 from app.models.enums import Role, TicketStatus
+from app.models.time_entry import TimeEntry
 from app.repositories.base import TicketPage, TicketQuery, TicketRepository, UserRepository
 from app.services.notifications import Notification, NotificationRepository
 
@@ -76,6 +77,11 @@ class TicketORM(Base):
         cascade="all, delete-orphan",
         order_by="HistoryEventORM.id",
     )
+    time_entries: Mapped[list["TimeEntryORM"]] = relationship(
+        back_populates="ticket",
+        cascade="all, delete-orphan",
+        order_by="TimeEntryORM.worked_on, TimeEntryORM.created_at",
+    )
 
 
 class CommentORM(Base):
@@ -115,6 +121,30 @@ class NotificationORM(Base):
     type: Mapped[str] = mapped_column(String(50))
     read_at: Mapped[datetime | None]
     created_at: Mapped[datetime]
+
+
+class TimeEntryORM(Base):
+    """ORM para la tabla time_entries.
+
+    Patrón Comment: ticket_id FK con ON DELETE CASCADE, back_populates en TicketORM.
+    El CHECK de minutes (1–480) lo declara la base en DDL; aquí lo replicamos
+    como CheckConstraint para que la metadata de SQLAlchemy quede consistente.
+    """
+
+    __tablename__ = "time_entries"
+    __table_args__ = (
+        CheckConstraint("minutes >= 1 AND minutes <= 480", name="ck_time_entries_minutes"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"))
+    technician_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    minutes: Mapped[int]
+    description: Mapped[str] = mapped_column(String(255))
+    worked_on: Mapped[date]
+    created_at: Mapped[datetime]
+
+    ticket: Mapped["TicketORM"] = relationship(back_populates="time_entries")
 
 
 # --- traduccion entre filas ORM y dataclasses de dominio --------------------
@@ -157,6 +187,18 @@ def _ticket_to_domain(row: TicketORM) -> Ticket:
             created_at=event.created_at,
         )
         for event in row.history
+    ]
+    ticket.time_entries = [
+        TimeEntry(
+            id=te.id,
+            ticket_id=te.ticket_id,
+            technician_id=te.technician_id,
+            minutes=te.minutes,
+            description=te.description,
+            worked_on=te.worked_on,
+            created_at=te.created_at,
+        )
+        for te in row.time_entries
     ]
     return ticket
 
@@ -296,12 +338,31 @@ class SqlAlchemyTicketRepository(TicketRepository):
         row.comments.extend(comment_row for _, comment_row in new_comments)
         row.history.extend(event_row for _, event_row in new_events)
 
+        # Registros de tiempo nuevos: igual que comments, solo id None se insertan.
+        new_time_entries = [
+            (
+                te,
+                TimeEntryORM(
+                    technician_id=te.technician_id,
+                    minutes=te.minutes,
+                    description=te.description,
+                    worked_on=te.worked_on,
+                    created_at=te.created_at,
+                ),
+            )
+            for te in ticket.time_entries
+            if te.id is None
+        ]
+        row.time_entries.extend(te_row for _, te_row in new_time_entries)
+
         self._session.flush()
         # Devolvemos al dominio las llaves que genero PostgreSQL.
         for comment, comment_row in new_comments:
             comment.id = comment_row.id
         for event, event_row in new_events:
             event.id = event_row.id
+        for te, te_row in new_time_entries:
+            te.id = te_row.id
         # Si cambio la prioridad, el trigger recalculo due_at: lo releemos.
         self._session.refresh(row, ["due_at"])
         ticket.due_at = row.due_at
@@ -433,5 +494,62 @@ def _notification_to_domain(row: NotificationORM) -> Notification:
         message=row.message,
         type=row.type,
         read_at=row.read_at,
+        created_at=row.created_at,
+    )
+
+
+class SqlAlchemyTimeEntryRepository:
+    """Repositorio de registros de tiempo, respaldado por la tabla time_entries.
+
+    No extiende un ABC porque TimeEntry no sigue el mismo contrato de Ticket/User:
+    no hay update() ni delete() en el alcance de la ficha. Los tres métodos son
+    los que necesita el servicio para registrar y consultar tiempo.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(self, entry: TimeEntry) -> TimeEntry:
+        """Inserta un registro nuevo y escribe el id asignado por PostgreSQL."""
+        row = TimeEntryORM(
+            ticket_id=entry.ticket_id,
+            technician_id=entry.technician_id,
+            minutes=entry.minutes,
+            description=entry.description,
+            worked_on=entry.worked_on,
+            created_at=entry.created_at,
+        )
+        self._session.add(row)
+        self._session.flush()
+        entry.id = row.id
+        return entry
+
+    def list_by_ticket(self, ticket_id: int) -> list[TimeEntry]:
+        """Devuelve todos los registros del ticket, ordenados por worked_on y created_at."""
+        rows = self._session.scalars(
+            select(TimeEntryORM)
+            .where(TimeEntryORM.ticket_id == ticket_id)
+            .order_by(TimeEntryORM.worked_on, TimeEntryORM.created_at)
+        ).all()
+        return [_time_entry_to_domain(row) for row in rows]
+
+    def total_minutes(self, ticket_id: int) -> int:
+        """Suma de minutos del ticket; devuelve 0 si no hay registros."""
+        result = self._session.scalar(
+            select(func.sum(TimeEntryORM.minutes)).where(
+                TimeEntryORM.ticket_id == ticket_id
+            )
+        )
+        return int(result) if result is not None else 0
+
+
+def _time_entry_to_domain(row: TimeEntryORM) -> TimeEntry:
+    return TimeEntry(
+        id=row.id,
+        ticket_id=row.ticket_id,
+        technician_id=row.technician_id,
+        minutes=row.minutes,
+        description=row.description,
+        worked_on=row.worked_on,
         created_at=row.created_at,
     )
